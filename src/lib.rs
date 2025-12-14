@@ -47,16 +47,16 @@
 //! dlls from your Vcpkg installation to be available in your path.
 //!
 //! ## WASM 32
-//! 
+//!
 //! At this time, vcpkg has a single triplet for wasm32, wasm32-emscripten,
 //! while rust has several targets for wasm32.
 //! Currently all of these targets are mapped to wasm32-emscripten triplet.
-//! 
+//!
 //! You can open an [issue](https://github.com/mcgoo/vcpkg-rs/issue)
-//! if more wasm32 triplets come to vcpkg. 
-//! And just like other target, it is possibleto select a custom triplet 
+//! if more wasm32 triplets come to vcpkg.
+//! And just like other target, it is possibleto select a custom triplet
 //! using the `VCPKGRS_TRIPLET` environment variable.
-//! 
+//!
 //! # Environment variables
 //!
 //! A number of environment variables are available to globally configure which
@@ -72,7 +72,7 @@
 //! A typical use case is to set it to `vcpkg_installed` directory under build directory
 //! to adapt [manifest mode of vcpkg](https://learn.microsoft.com/en-us/vcpkg/users/manifests).
 //! If set, this will override the default value of `VCPKG_ROOT/installed`.
-//!  
+//!
 //! * `VCPKGRS_TRIPLET` - Use this to override vcpkg-rs' default triplet selection with your own.
 //! This is how to select a custom vcpkg triplet.
 //!
@@ -86,7 +86,7 @@
 //! ## cargo vcpkg
 //! [`cargo vcpkg`](https://crates.io/crates/cargo-vcpkg) can fetch and build a vcpkg installation of
 //! required packages from scratch. It merges package requirements specified in the `Cargo.toml` of
-//! crates in the dependency tree.  
+//! crates in the dependency tree.
 //! ## vcpkg_cli
 //! There is also a rudimentary companion crate, `vcpkg_cli` that allows testing of environment
 //! and flag combinations.
@@ -431,8 +431,14 @@ fn find_vcpkg_target(cfg: &Config, target_triplet: &TargetTriplet) -> Result<Vcp
 
     base.push(&target_triplet.triplet);
 
-    let lib_path = base.join("lib");
-    let bin_path = base.join("bin");
+    let is_debug = env::var("PROFILE").unwrap_or(String::new()) == "debug";
+
+    let (lib_path, bin_path) = if is_debug {
+        (base.join("debug").join("lib"), base.join("debug").join("bin"))
+    } else {
+        (base.join("lib"), base.join("bin"))
+    };
+
     let include_path = base.join("include");
     let packages_path = vcpkg_root.join("packages");
 
@@ -443,6 +449,7 @@ fn find_vcpkg_target(cfg: &Config, target_triplet: &TargetTriplet) -> Result<Vcp
         status_path: status_path,
         packages_path: packages_path,
         target_triplet: target_triplet.clone(),
+        is_debug: is_debug,
     })
 }
 
@@ -655,8 +662,21 @@ fn load_port_manifest(
 
     let file = BufReader::new(&f);
 
-    let dll_prefix = Path::new(&vcpkg_target.target_triplet.triplet).join("bin");
-    let lib_prefix = Path::new(&vcpkg_target.target_triplet.triplet).join("lib");
+    let (dll_prefix, lib_prefix) = if vcpkg_target.is_debug {
+        (
+            Path::new(&vcpkg_target.target_triplet.triplet)
+                .join("debug")
+                .join("bin"),
+            Path::new(&vcpkg_target.target_triplet.triplet)
+                .join("debug")
+                .join("lib"),
+        )
+    } else {
+        (
+            Path::new(&vcpkg_target.target_triplet.triplet).join("bin"),
+            Path::new(&vcpkg_target.target_triplet.triplet).join("lib"),
+        )
+    };
 
     for line in file.lines() {
         let line = line.unwrap();
@@ -683,11 +703,26 @@ fn load_port_manifest(
     }
 
     // Load .pc files for hints about intra-port library ordering.
-    let pkg_config_prefix = vcpkg_target
-        .packages_path
-        .join(format!("{}_{}", port, vcpkg_target.target_triplet.triplet))
-        .join("lib")
-        .join("pkgconfig");
+    let pkg_config_prefix = if vcpkg_target.is_debug {
+        vcpkg_target
+            .packages_path
+            .join(format!(
+                "{}_{}",
+                port, vcpkg_target.target_triplet.triplet
+            ))
+            .join("debug")
+            .join("lib")
+            .join("pkgconfig")
+    } else {
+        vcpkg_target
+            .packages_path
+            .join(format!(
+                "{}_{}",
+                port, vcpkg_target.target_triplet.triplet
+            ))
+            .join("lib")
+            .join("pkgconfig")
+    };
     // Try loading the pc files, if they are present. Not all ports have pkgconfig.
     if let Ok(pc_files) = PcFiles::load_pkgconfig_dir(vcpkg_target, &pkg_config_prefix) {
         // Use the .pc file data to potentially sort the libs to the correct order.
@@ -867,6 +902,9 @@ struct VcpkgTarget {
 
     // target-specific settings.
     target_triplet: TargetTriplet,
+
+    // is debug build
+    is_debug: bool,
 }
 
 impl VcpkgTarget {
@@ -1976,6 +2014,30 @@ mod tests {
         clean_env();
     }
 
+    #[test]
+    fn debug_build_finds_debug_lib() {
+        let _g = LOCK.lock();
+        clean_env();
+        env::set_var("VCPKG_ROOT", vcpkg_test_tree_loc("normalized"));
+        env::set_var("TARGET", "x86_64-pc-windows-msvc");
+        env::set_var("PROFILE", "debug"); // Set profile to debug
+        env::set_var("CARGO_CFG_TARGET_FEATURE", "crt-static"); // Use static CRT to match test data
+        let tmp_dir = tempdir().unwrap();
+        env::set_var("OUT_DIR", tmp_dir.path());
+
+        // boost-filesystem has debug libs in the test data
+        let lib = ::find_package("boost-filesystem").unwrap();
+
+        // Check if any found lib contains "debug" in its path
+        let found_debug = lib
+            .found_libs
+            .iter()
+            .any(|p| p.to_string_lossy().to_lowercase().contains("debug"));
+        assert!(found_debug, "Should find debug libraries in debug profile");
+
+        clean_env();
+    }
+
     fn clean_env() {
         env::remove_var("TARGET");
         env::remove_var("VCPKG_ROOT");
@@ -1985,6 +2047,7 @@ mod tests {
         env::remove_var("VCPKGRS_DISABLE");
         env::remove_var("VCPKGRS_NO_LIBMYSQL");
         env::remove_var("VCPKGRS_TRIPLET");
+        env::remove_var("PROFILE");
     }
 
     // path to a to vcpkg installation to test against
