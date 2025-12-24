@@ -143,6 +143,9 @@ pub struct Config {
     /// .dlls that must be be found for probing to be considered successful
     required_dlls: Vec<String>,
 
+    /// libraries that need to be linked with whole-archive
+    whole_archive_libs: Vec<String>,
+
     /// should DLLs be copied to OUT_DIR?
     copy_dlls: bool,
 
@@ -462,6 +465,8 @@ struct PcFile {
     libs: Vec<String>,
     /// List of pkgconfig dependencies, e.g. PcFile::id.
     deps: Vec<String>,
+    /// List of libraries that need to be linked with whole-archive, based on -Wl,--whole-archive flags
+    whole_archive_libs: Vec<String>,
 }
 impl PcFile {
     fn parse_pc_file(vcpkg_target: &VcpkgTarget, path: &Path) -> Result<Self, Error> {
@@ -486,6 +491,7 @@ impl PcFile {
     fn from_str(id: &str, s: &str, target_triplet: &TargetTriplet) -> Result<Self, Error> {
         let mut libs = Vec::new();
         let mut deps = Vec::new();
+        let mut whole_archive_libs = Vec::new();
 
         for line in s.lines() {
             // We could collect a lot of stuff here, but we only care about Requires and Libs for the moment.
@@ -508,26 +514,78 @@ impl PcFile {
                     deps.push(dep.to_owned());
                 }
             } else if line.starts_with("Libs:") {
-                let lib_flags = line
+                let tokens: Vec<&str> = line
                     .split(":")
                     .skip(1)
                     .next()
                     .unwrap_or("")
-                    .split_whitespace();
-                for lib_flag in lib_flags {
-                    if lib_flag.starts_with("-l") {
-                        // reconstruct the library name.
-                        let lib = format!(
-                            "{}{}.{}",
-                            if target_triplet.strip_lib_prefix {
-                                "lib"
+                    .split_whitespace()
+                    .collect();
+
+                let mut i = 0;
+                let mut in_whole_archive = false;
+                while i < tokens.len() {
+                    let token = tokens[i];
+
+                    // Check for whole-archive flags
+                    match token {
+                        "-Wl,--whole-archive" => {
+                            in_whole_archive = true;
+                            i += 1;
+                        }
+                        "-Wl,--no-whole-archive" => {
+                            in_whole_archive = false;
+                            i += 1;
+                        }
+                        "-Xlinker" => {
+                            // Check next token
+                            if i + 1 < tokens.len() {
+                                let next_token = tokens[i + 1];
+                                if next_token == "--whole-archive" {
+                                    in_whole_archive = true;
+                                    i += 2;
+                                } else if next_token == "--no-whole-archive" {
+                                    in_whole_archive = false;
+                                    i += 2;
+                                } else {
+                                    // Unknown -Xlinker argument, skip it
+                                    i += 2;
+                                }
                             } else {
-                                ""
-                            },
-                            lib_flag.trim_left_matches("-l"),
-                            target_triplet.lib_suffix
-                        );
-                        libs.push(lib);
+                                // Malformed -Xlinker without argument
+                                i += 1;
+                            }
+                        }
+                        "/WHOLEARCHIVE" | "-WHOLEARCHIVE" => {
+                            // MSVC whole-archive flag (usually not in .pc files, but handle anyway)
+                            in_whole_archive = true;
+                            i += 1;
+                        }
+                        "/WHOLEARCHIVE:NO" | "-WHOLEARCHIVE:NO" => {
+                            in_whole_archive = false;
+                            i += 1;
+                        }
+                        _ => {
+                            if token.starts_with("-l") {
+                                // reconstruct the library name.
+                                let lib = format!(
+                                    "{}{}.{}",
+                                    if target_triplet.strip_lib_prefix {
+                                        "lib"
+                                    } else {
+                                        ""
+                                    },
+                                    token.trim_left_matches("-l"),
+                                    target_triplet.lib_suffix
+                                );
+                                libs.push(lib.clone());
+                                if in_whole_archive {
+                                    whole_archive_libs.push(lib);
+                                }
+                            }
+                            // Skip other flags like -L, -I, etc.
+                            i += 1;
+                        }
                     }
                 }
             }
@@ -537,6 +595,7 @@ impl PcFile {
             id: id.to_string(),
             libs: libs,
             deps: deps,
+            whole_archive_libs: whole_archive_libs,
         })
     }
 }
@@ -637,6 +696,9 @@ struct Port {
 
     // ports that this port depends on
     deps: Vec<String>,
+
+    // libraries that need to be linked with whole-archive
+    whole_archive_libs: Vec<String>,
 }
 
 fn load_port_manifest(
@@ -644,7 +706,7 @@ fn load_port_manifest(
     port: &str,
     version: &str,
     vcpkg_target: &VcpkgTarget,
-) -> Result<(Vec<String>, Vec<String>), Error> {
+) -> Result<(Vec<String>, Vec<String>, Vec<String>), Error> {
     let manifest_file = path.join("info").join(format!(
         "{}_{}_{}.list",
         port, version, vcpkg_target.target_triplet.triplet
@@ -723,13 +785,24 @@ fn load_port_manifest(
             .join("lib")
             .join("pkgconfig")
     };
+
+    let mut whole_archive_libs = Vec::new();
     // Try loading the pc files, if they are present. Not all ports have pkgconfig.
     if let Ok(pc_files) = PcFiles::load_pkgconfig_dir(vcpkg_target, &pkg_config_prefix) {
         // Use the .pc file data to potentially sort the libs to the correct order.
         libs = pc_files.fix_ordering(libs);
+
+        // Collect all libraries that need whole-archive linking
+        let mut whole_set = std::collections::HashSet::new();
+        for pc_file in pc_files.files.values() {
+            for lib in &pc_file.whole_archive_libs {
+                whole_set.insert(lib.clone());
+            }
+        }
+        whole_archive_libs = whole_set.into_iter().collect();
     }
 
-    Ok((dlls, libs))
+    Ok((dlls, libs, whole_archive_libs))
 }
 
 // load ports from the status file or one of the incremental updates
@@ -862,6 +935,7 @@ fn load_ports(target: &VcpkgTarget) -> Result<BTreeMap<String, Port>, Error> {
                             dlls: lib_info.0,
                             libs: lib_info.1,
                             deps: deps,
+                            whole_archive_libs: lib_info.2,
                         };
 
                         ports.insert(name.to_string(), port);
@@ -1051,6 +1125,13 @@ impl Config {
                                 .to_string_lossy()
                                 .into_owned()
                         }));
+                    self.whole_archive_libs.extend(port.whole_archive_libs.iter().map(|s| {
+                        Path::new(&s)
+                            .file_stem()
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned()
+                    }));
                 }
             }
         }
@@ -1262,8 +1343,13 @@ impl Config {
                 false => required_lib,
             };
 
-            lib.cargo_metadata
-                .push(format!("cargo:rustc-link-lib={}", link_name));
+            let needs_whole_archive = vcpkg_target.target_triplet.is_static &&
+                self.whole_archive_libs.contains(required_lib);
+            if needs_whole_archive {
+                lib.cargo_metadata.push(format!("cargo:rustc-link-lib=static:+whole-archive={}", link_name));
+            } else {
+                lib.cargo_metadata.push(format!("cargo:rustc-link-lib={}", link_name));
+            }
 
             lib.found_names.push(String::from(link_name));
 
@@ -1598,6 +1684,56 @@ mod tests {
             _ => false,
         });
         clean_env();
+    }
+
+    #[test]
+    fn pc_file_whole_archive_parsing() {
+        // Test parsing of whole-archive flags in .pc files
+        use super::TargetTriplet;
+
+        // Create a target triplet for Linux (strip_lib_prefix = true, lib_suffix = "a")
+        let target = TargetTriplet {
+            triplet: "x64-linux".to_string(),
+            is_static: true,
+            lib_suffix: "a".to_string(),
+            strip_lib_prefix: true,
+        };
+
+        // Test 1: Simple -Wl,--whole-archive
+        let pc_content1 = "Name: test\nLibs: -Wl,--whole-archive -ltest1 -Wl,--no-whole-archive -ltest2\n";
+        let pc_file1 = super::PcFile::from_str("test", pc_content1, &target).unwrap();
+        assert_eq!(pc_file1.libs, vec!["libtest1.a", "libtest2.a"]);
+        assert_eq!(pc_file1.whole_archive_libs, vec!["libtest1.a"]);
+
+        // Test 2: -Xlinker syntax
+        let pc_content2 = "Name: test\nLibs: -Xlinker --whole-archive -ltest3 -Xlinker --no-whole-archive -ltest4\n";
+        let pc_file2 = super::PcFile::from_str("test", pc_content2, &target).unwrap();
+        assert_eq!(pc_file2.libs, vec!["libtest3.a", "libtest4.a"]);
+        assert_eq!(pc_file2.whole_archive_libs, vec!["libtest3.a"]);
+
+        // Test 3: Nested whole-archive scopes
+        let pc_content3 = "Name: test\nLibs: -Wl,--whole-archive -la -lb -Wl,--no-whole-archive -lc -Wl,--whole-archive -ld\n";
+        let pc_file3 = super::PcFile::from_str("test", pc_content3, &target).unwrap();
+        assert_eq!(pc_file3.libs, vec!["liba.a", "libb.a", "libc.a", "libd.a"]);
+        assert_eq!(pc_file3.whole_archive_libs, vec!["liba.a", "libb.a", "libd.a"]);
+
+        // Test 4: No whole-archive flags
+        let pc_content4 = "Name: test\nLibs: -ltest5 -ltest6\n";
+        let pc_file4 = super::PcFile::from_str("test", pc_content4, &target).unwrap();
+        assert_eq!(pc_file4.libs, vec!["libtest5.a", "libtest6.a"]);
+        assert!(pc_file4.whole_archive_libs.is_empty());
+
+        // Test 5: Windows style (no lib prefix)
+        let target_windows = TargetTriplet {
+            triplet: "x64-windows".to_string(),
+            is_static: true,
+            lib_suffix: "lib".to_string(),
+            strip_lib_prefix: false,
+        };
+        let pc_content5 = "Name: test\nLibs: -Wl,--whole-archive -ltest7 -Wl,--no-whole-archive\n";
+        let pc_file5 = super::PcFile::from_str("test", pc_content5, &target_windows).unwrap();
+        assert_eq!(pc_file5.libs, vec!["test7.lib"]);
+        assert_eq!(pc_file5.whole_archive_libs, vec!["test7.lib"]);
     }
 
     #[test]
